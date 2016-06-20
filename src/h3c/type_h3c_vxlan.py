@@ -67,9 +67,8 @@ class H3CVxlanTypeDriver(type_tunnel.TunnelTypeDriver):
 
     def _verify_vni_ranges(self):
         try:
-            self.conf_vxlan_ranges = self._parse_h3c_vni_ranges(
-                cfg.CONF.ml2_type_h3c_vxlan.vni_ranges, self.tunnel_ranges)
-            LOG.info("H3C VNI ranges: %s", self.conf_vxlan_ranges)
+            self._parse_h3c_vni_ranges(cfg.CONF.ml2_type_h3c_vxlan.vni_ranges,
+                                       self.tunnel_ranges)
         except Exception:
             LOG.exception("Failed to parse vni_ranges. "
                           "Service terminated!")

@@ -47,6 +47,7 @@ TOPOLOGY_EVENT_SMOOTH_START = 0x08
 TOPOLOGY_EVENT_DATA = 0x09
 TOPOLOGY_EVENT_SMOOTH_END = 0x0a
 
+NEUTRON_NETTYPE_VLAN = '3'
 L3AGENT_TOPO_TYPE_LEAF = 2
 
 STR_LEN = 255
@@ -63,7 +64,6 @@ VLAN_DEFAULT_ID = 4097
 MAX_VPN = 1024
 
 TYPE_H3C_VXLAN = 'h3c_vxlan'
-
 
 class H3CAgent(model_base.BASEV2):
     """Represents agents running in neutron deployments."""
@@ -142,6 +142,14 @@ class H3CNotifierBase(object):
                             msg=msg)
         return result
 
+    def api_cast(self, context, method, msg, host):
+        cctxt = self.client.prepare(fanout=False,
+                                    topic=self.topic,
+                                    server=host)
+        cctxt.cast(context,
+                   method,
+                   msg=msg)
+
 
 class H3CNotifierApi(H3CNotifierBase):
     """Agent side of the openvswitch rpc API.
@@ -164,10 +172,10 @@ class H3CNotifierApi(H3CNotifierBase):
         return result
 
     def notify_host(self, context, method, msg, host):
-        result = self.api_call(context,
-                               method,
-                               msg,
-                               host)
+        self.api_cast(context,
+                      method,
+                      msg,
+                      host)
 
 
 class H3CDriver(driver_api.MechanismDriver):
@@ -177,7 +185,6 @@ class H3CDriver(driver_api.MechanismDriver):
     def __init__(self, rpc=None):
         LOG.info("H3CDriver init")
         self.sync_helper = None
-        self.agent = None
         self.db = db.db_lib()
         self.context = n_context.get_admin_context_without_session()
         self.session = dbapi.get_session()
@@ -193,6 +200,9 @@ class H3CDriver(driver_api.MechanismDriver):
     def _setup_rpc(self):
         self.notifier = H3CNotifierApi('l2-h3c-agent')
 
+    def is_vxlan(self, network_type):
+        return network_type == TYPE_H3C_VXLAN or network_type == 'vxlan'
+
     def start_rpc_listeners(self):
         LOG.info("H3CDriver start_rpc_listeners")
         self.endpoints = [self]
@@ -206,20 +216,18 @@ class H3CDriver(driver_api.MechanismDriver):
         heartbeat = threading.Timer(REPORT_INTERVAL, self.agent_aging)
         heartbeat.start()
 
-    def _get_agent_by_type_and_host(self, agent_type, host):
-        session = self.session
-        with session.begin(subtransactions=True):
-            query = session.query(H3CAgent)
-            try:
-                agent_db = query.filter_by(agent_type=agent_type,
-                                           host=host).one()
-                return agent_db
-            except exc.NoResultFound:
-                raise ext_a.AgentNotFoundByTypeHost(agent_type=agent_type,
-                                                    host=host)
-            except exc.MultipleResultsFound:
-                raise ext_a.MultipleAgentFoundByTypeHost(agent_type=agent_type,
-                                                         host=host)
+    def _get_agent_by_type_and_host(self, context, agent_type, host):
+        query = context.session.query(H3CAgent)
+        try:
+            agent_db = query.filter_by(agent_type=agent_type,
+                                       host=host).one()
+            return agent_db
+        except exc.NoResultFound:
+            raise ext_a.AgentNotFoundByTypeHost(agent_type=agent_type,
+                                                host=host)
+        except exc.MultipleResultsFound:
+            raise ext_a.MultipleAgentFoundByTypeHost(agent_type=agent_type,
+                                                     host=host)
 
     def agent_aging(self):
         session = self.session
@@ -235,8 +243,8 @@ class H3CDriver(driver_api.MechanismDriver):
                     if time_differ:
                         one_agent['admin_state_up'] = False
                         one_agent.update(one_agent)
-                        self.db.aging_computer_by_host(one_agent['host'])
-                        self.db.aging_dev_by_host(one_agent['host'])
+                        self.db.aging_host_topology(one_agent['host'])
+                        self.db.aging_device_topology(one_agent['host'])
                         LOG.info("h3c_agent %s aging success",
                                  one_agent['host'])
             except Exception as e:
@@ -248,18 +256,16 @@ class H3CDriver(driver_api.MechanismDriver):
         with context.session.begin(subtransactions=True):
             res_keys = ['agent_type', 'host', 'topic']
             res = dict((k, agent[k]) for k in res_keys)
-
             configurations_dict = agent.get('configurations', {})
             res['configurations'] = jsonutils.dumps(configurations_dict)
-
             current_time = timeutils.utcnow()
             try:
-                agent_db = self._get_agent_by_type_and_host(
-                    agent['agent_type'], agent['host'])
                 res['heartbeat_timestamp'] = current_time
                 res['admin_state_up'] = True
                 if agent.get('start_flag'):
                     res['started_at'] = current_time
+                agent_db = self._get_agent_by_type_and_host(
+                    context, agent['agent_type'], agent['host'])
                 agent_db.update(res)
             except ext_a.AgentNotFoundByTypeHost:
                 res['created_at'] = current_time
@@ -267,12 +273,9 @@ class H3CDriver(driver_api.MechanismDriver):
                 res['heartbeat_timestamp'] = current_time
                 res['admin_state_up'] = True
                 agent_db = H3CAgent(**res)
-                session = self.session
-                with session.begin():
-                    session.add(agent_db)
+                context.session.add(agent_db)
 
     def report_state(self, context, **kwargs):
-        self.agent = context
         time = kwargs['time']
         time = timeutils.parse_strtime(time)
         if self.START_TIME > time:
@@ -347,97 +350,156 @@ class H3CDriver(driver_api.MechanismDriver):
 
         session = self.session
         with session.begin(subtransactions=True):
-            query = (session.query(VpnAllocation).
+            (session.query(VpnAllocation).
                      filter_by(vpn_id=vpn_id, router_id=router_id).delete())
         return
 
-    def get_topo_info(self, context, **kwargs):
-        LOG.info("get_topo_info msg:%s", kwargs.get('msg'))
-        type = kwargs.get('msg').get('net_type')
-        if L3AGENT_TOPO_TYPE_LEAF == type:
-            spine_mac = kwargs.get('msg').get('spine_mac')
-            return self.db.get_all_leaf(spine_mac)
-        return None
-
-    def batchport(self, mac):
-        msg = self.db.get_port_cfg(mac)
-        LOG.info('batchport to %s: %s', str(mac), msg)
+    def smooth(self, context, mac, role, net_type):
+        if net_type == NEUTRON_NETTYPE_VLAN:
+            network_type = 'vlan'
+        else:
+            network_type = 'vxlan'
+        msg = self.db.batch_device_cfg(context, mac, role, network_type)
+        LOG.info('smooth to %s: %s', str(mac), msg)
         if msg:
             try:
-                self.notifier.notify_host(self.context, 'smooth_port',
+                self.notifier.notify_host(self.context,
+                                          'smooth_port',
                                           msg, mac)
-            except Exception as excpt:
+            except Exception as e:
                 LOG.warn(_LW("batch_port failed to send msg to %s, err:%s"),
-                         mac, excpt)
+                         mac, e)
 
-    def batch_spine_cfg(self, topo):
-        mac = topo[0]['dev_mac']
-        msg = self.db.get_cfg(topo, mac)
-        LOG.info('batch_spine_cfg to %s: %s', str(mac), msg)
-        if msg:
-            try:
-                self.notifier.notify_host(self.context, 'smooth_port',
-                                          msg, mac)
-            except Exception as e:
-                LOG.warn(_LW("batch_spine_cfg failed to send msg to %s,"
-                             " err:%s"), mac, e)
+    def get_device_cfg(self, context, topo, net_type, is_del):
+        if net_type == NEUTRON_NETTYPE_VLAN:
+            mac = topo[0]['device_mac']
+            msg = {}
+            msg_dev = self.db.get_vlan_by_device(context.session, topo, mac, is_del)
+            LOG.info('get_device_cfg to %s--%s: %s', mac, is_del, msg_dev)
+            if len(msg_dev) > 0:
+                try:
+                    if is_del == False:
+                        msg['add'] = msg_dev
+                    else:
+                        msg['del'] = msg_dev
+                    self.notifier.api_fanout_cast(self.context, 'process_change_vlan',
+                                                  msg)
+                except Exception as e:
+                    LOG.warn(_LW("get_device_cfg failed to send msg to %s,"
+                                 " err:%s"), mac, e)
 
-    def batch_leaf_cfg(self, topo):
+    def get_host_cfg(self, context, topo, net_type, is_del):
         mac = topo[0]['leaf_mac']
-        msg = self.db.get_cfg_by_leaf(topo, mac)
-        LOG.info('batch_leaf_cfg to %s: %s', str(mac), msg)
-        if msg:
+        msg = {}
+        if net_type != NEUTRON_NETTYPE_VLAN:
+            msg_host = self.db.get_leaf_vxlan_by_topology(context.session,
+                                                          topo, mac, is_del)
+        else:
+            msg_host = self.db.get_host_vlan_by_topology(context.session,
+                                                         topo, mac, is_del)
+            if is_del is True:
+                return msg_host
+        LOG.info('get_host_cfg to %s--%s: %s', mac, is_del, msg_host)
+        if len(msg_host) > 0:
             try:
-                self.notifier.notify_host(self.context, 'smooth_port',
-                                          msg, mac)
+                if is_del == False:
+                    msg['add'] = msg_host
+                else:
+                    msg['del'] = msg_host
+                if net_type != NEUTRON_NETTYPE_VLAN:
+                    self.notifier.notify_host(self.context,
+                                              'process_change_vxlan',
+                                              msg, mac)
+                else:
+                    self.notifier.api_fanout_cast(self.context,
+                                                  'process_change_vlan',
+                                                  msg)
             except Exception as e:
-                LOG.warn(_LW("batch_leaf_cfg failed to send msg to %s,"
+                LOG.warn(_LW("get_host_cfg failed to send msg to %s,"
                              " err:%s"), mac, e)
 
-    def Procdevice(self, data, batch):
+    def process_device(self, context, data, batch, net_type):
         change = data['del']
         if len(change) > 0:
-            self.db.delete_devtopo(change)
+            self.get_device_cfg(context, change, net_type, True)
+            self.db.delete_device_topology(context, change)
 
         change = data['add']
         if len(change) > 0:
-            self.db.create_devtopo(change, batch)
-            self.batch_spine_cfg(change)
+            self.db.create_device_topology(context, change, batch)
+            self.get_device_cfg(context, change, net_type, False)
 
         change = data['mod']
         if len(change) > 0:
-            self.db.update_devtopo(change)
+            self.db.update_device_topology(context, change)
 
-    def Proccomputer(self, data, batch):
+    def process_host(self, context, data, batch, net_type):
         change = data['del']
         if len(change) > 0:
-            self.db.delete_computertopo(change)
+            msg_host = self.get_host_cfg(context, change, net_type, True)
+            self.db.delete_host_topology(context, change)
+            if ((net_type == NEUTRON_NETTYPE_VLAN) and
+                len(msg_host)) > 0:
+                msg = {}
+                self.db.get_vlan_up_info(context.session, msg_host)
+                LOG.info('process topo delete for vlan to %s, %s',
+                         change[0]['leaf_mac'], msg_host)
+                try:
+                    msg['del'] = msg_host
+                    self.notifier.api_fanout_cast(self.context,
+                                                  'process_change_vlan',
+                                                  msg)
+                except Exception as e:
+                    LOG.warn(_LW("process topo delete failed, dev_mac %s,"
+                                 " err:%s"), change[0]['leaf_mac'], e)            
 
         change = data['add']
         if len(change) > 0:
-            self.db.create_computertopo(change, batch)
-            self.batch_leaf_cfg(change)
+            self.db.create_host_topogoly(context, change, batch)
+            self.get_host_cfg(context, change, net_type, False)
 
         change = data['mod']
         if len(change) > 0:
-            self.db.update_computertopo(change)
+            self.db.update_host_topology(context, change)
 
-    def ProcessTopo(self, context, **kwargs):
+    def process_topology(self, context, **kwargs):
         msg = kwargs['msg']
+        LOG.info('process topology event %s', msg)
         try:
             if msg['event'] == TOPOLOGY_EVENT_DATA:
                 batch = False
+                net_type = msg['net_type']
                 if 'batch' in msg:
                     batch = True
-                self.Procdevice(msg['device'], batch)
-                self.Proccomputer(msg['computer'], batch)
+                self.process_device(context, msg['device'], batch, net_type)
+                self.process_host(context, msg['host'], batch, net_type)
             elif msg['event'] == TOPOLOGY_EVENT_SMOOTH_START:
-                self.db.smoothstart_topo(msg['dev_mac'])
+                self.db.smoothstart_topology(context, msg['device_mac'])
             elif msg['event'] == TOPOLOGY_EVENT_SMOOTH_END:
-                self.db.smoothend_topo(msg['dev_mac'])
-                self.batchport(msg['dev_mac'])
+                self.db.smoothend_topology(context, msg['device_mac'])
+                role = msg.get('role')
+                net_type = msg.get('net_type')
+                self.smooth(context, msg['device_mac'], role, net_type)
         except Exception as e:
-            LOG.exception(_LW('Process topo event error %s'), e)
+            LOG.exception(_LW('process topology event error %s'), e)
+
+    def process_aggregation(self, context, **kwargs):
+        msg = kwargs['msg']
+        LOG.info('process aggregation event %s', msg)
+        try:
+            if msg['net_type'] == NEUTRON_NETTYPE_VLAN:
+                network_type = 'vlan'
+            else:
+                network_type = 'vxlan'
+            if msg['event'] == 'join':
+                self.db.update_aggr_info(context, msg['mac'], network_type,
+                                         msg['role'], msg['phy_if'],
+                                         msg['aggr_if'])
+            elif msg['event'] == 'leave':
+                self.db.update_aggr_info(context, msg['mac'], network_type,
+                                          msg['role'], msg['phy_if'], None)
+        except Exception as e:
+            LOG.exception('process aggregation event error %s', e)
 
     def create_network_precommit(self, context):
         pass
@@ -446,12 +508,12 @@ class H3CDriver(driver_api.MechanismDriver):
         network = context.current
         network_id = network['id']
         tenant_id = network['tenant_id']
+        segments = context.network_segments
+        segment_id = segments[0]['segmentation_id']
 
         LOG.info(_("Create network postcommit begin."))
         with self.rlock:
             if not self.db.is_network_created(tenant_id, network_id):
-                segments = context.network_segments
-                segment_id = segments[0]['segmentation_id']
                 segment_type = segments[0]['network_type']
                 if segment_type in ['vlan', 'vxlan', 'h3c_vxlan']:
                     self.db.create_network(tenant_id,
@@ -486,7 +548,7 @@ class H3CDriver(driver_api.MechanismDriver):
                 """vxlan notify delete"""
                 segments = context.network_segments
                 segment_type = segments[0]['network_type']
-                if segment_type == 'h3c_vxlan':
+                if self.is_vxlan(segment_type):
                     msg = {}
                     msg['segment_id'] = segments[0]['segmentation_id']
                     msg['segment_type'] = segment_type
@@ -551,7 +613,7 @@ class H3CDriver(driver_api.MechanismDriver):
         LOG.info(_("Create port end."))
 
     def _is_segment_h3c_vxlan(self, segment):
-        return segment[api.NETWORK_TYPE] == TYPE_H3C_VXLAN
+        return self.is_vxlan(segment[api.NETWORK_TYPE])
 
     def _get_segments(self, top_segment, bottom_segment):
         # Return vlan segment and vxlan segment (if configured).
@@ -595,13 +657,7 @@ class H3CDriver(driver_api.MechanismDriver):
             LOG.info(_("Delete port %s, All VM in network %s is broken,"
                        " host:%s We need remove the configuration."),
                      str(port_id), str(network_id), str(host_id))
-
-        msg = {}
-        msg['net_segment'] = net_segment
-        msg['vlanId'] = vlanId
-        msg['segment_type'] = network_type
-
-        host_topos = self.db.get_host_topo(host_id)
+        host_topos = self.db.get_host_topology(host_id)
         self.db.delete_vm(device_id, host_id, port_id,
                           network_id, tenant_id, vlanId)
         if len(host_topos) == 0:
@@ -612,7 +668,7 @@ class H3CDriver(driver_api.MechanismDriver):
         for topo in host_topos:
             leaftopo = topo['leaf']
             if leaftopo.get('up_port'):
-                leafmac = leaftopo['dev_mac']
+                leafmac = leaftopo['device_mac']
                 if self.db.is_leaf_vm_exist(network_id, leafmac):
                     """have other hosts"""
                     LOG.info("delete_port have other host, network:%s"
@@ -621,6 +677,12 @@ class H3CDriver(driver_api.MechanismDriver):
                     leaftopo['up_port'] = []
                     if topo.get('spine'):
                         del topo['spine']
+
+        msg = {}
+        msg['segment_type'] = network_type
+        msg['net_segment'] = net_segment
+        if self.is_vxlan(network_type):
+            msg['vlanId'] = vlanId
 
         msg['topo'] = host_topos
         LOG.info("Notify delete_port %s", msg)
@@ -652,7 +714,7 @@ class H3CDriver(driver_api.MechanismDriver):
         old_host_id = None
 
         with self.rlock:
-            if network_type == TYPE_H3C_VXLAN:
+            if self.is_vxlan(network_type):
                 vlan_segment, vxlan_segment = self._get_segments(
                     context.top_bound_segment,
                     context.bottom_bound_segment)
@@ -723,9 +785,10 @@ class H3CDriver(driver_api.MechanismDriver):
             if vm_num_in_network == 1:
                 msg = {}
                 msg['net_segment'] = net_segment
-                msg['vlanId'] = vlanId
+                if self.is_vxlan(network_type):
+                    msg['vlanId'] = vlanId
                 msg['segment_type'] = network_type
-                host_topos = self.db.get_host_topo(host_id)
+                host_topos = self.db.get_host_topology(host_id)
                 if len(host_topos) == 0:
                     LOG.info(_("no find topo with VM %s network %s port %s."),
                              str(device_id), str(network_id), str(port_id))
@@ -757,7 +820,7 @@ class H3CDriver(driver_api.MechanismDriver):
         LOG.info(_("delete_port_postcommit begin."))
         segments = context.network.network_segments
         network_type = segments[0]['network_type']
-        if network_type == TYPE_H3C_VXLAN:
+        if self.is_vxlan(network_type):
             vlan_segment, vxlan_segment = self._get_segments(
                     context.top_bound_segment,
                     context.bottom_bound_segment)
